@@ -1,8 +1,10 @@
 #include "ai_camera.h"
 
+#include <assert.h>
 #include <string.h>
 #include <math.h>
 
+#include "cJSON.h"
 #include "leds.h"
 #include "nvs_flash.h"
 #include "esp_log.h"
@@ -18,6 +20,7 @@
 #include "light_sensor.h"
 #include "ai_pipeline.h"
 #include "json_settings_helpers.h"
+#include "sensor.h"
 
 #define CAM_PIN_PWDN   9
 #define CAM_PIN_RESET  11
@@ -121,6 +124,40 @@ static int default_config[AI_CAMERA_CONFIG_MAX] = {
     [AI_CAMERA_CONFIG_IR_BRIGHTNESS] = AI_CAMERA_IR_BRIGHTNESS_DEFAULT,
 };
 
+static int default_config_ov3660[AI_CAMERA_CONFIG_MAX] = {
+    [AI_CAMERA_CONFIG_RESOLUTION] = 6,
+    [AI_CAMERA_CONFIG_CONTRAST] = 0,
+    [AI_CAMERA_CONFIG_BRIGHTNESS] = 0,
+    [AI_CAMERA_CONFIG_SATURATION] = 0,
+    [AI_CAMERA_CONFIG_SHARPNESS] = 0,
+    [AI_CAMERA_CONFIG_DENOISE] = 1,
+    [AI_CAMERA_CONFIG_GAINCEILING] = 0,
+    [AI_CAMERA_CONFIG_JPEG_QUALITY] = 12,
+    [AI_CAMERA_CONFIG_COLORBAR] = 0,
+    [AI_CAMERA_CONFIG_WHITEBAL] = 1,
+    [AI_CAMERA_CONFIG_GAIN_CTRL] = 0,
+    [AI_CAMERA_CONFIG_EXPOSURE_CTRL] = 1,
+    [AI_CAMERA_CONFIG_HMIRROR] = 0,
+    [AI_CAMERA_CONFIG_VFLIP] = 0,
+    [AI_CAMERA_CONFIG_AEC2] = 0,
+    [AI_CAMERA_CONFIG_AWB_GAIN] = 1,
+    [AI_CAMERA_CONFIG_AGC_GAIN] = 4,
+    [AI_CAMERA_CONFIG_AEC_VALUE] = 600,
+    [AI_CAMERA_CONFIG_SPECIAL_EFFECT] = 0,
+    [AI_CAMERA_CONFIG_WB_MODE] = 0,
+    [AI_CAMERA_CONFIG_AE_LEVEL] = 0,
+    [AI_CAMERA_CONFIG_DCW] = 1,
+    [AI_CAMERA_CONFIG_BPC] = 1,
+    [AI_CAMERA_CONFIG_WPC] = 1,
+    [AI_CAMERA_CONFIG_RAW_GMA] = 0,
+    [AI_CAMERA_CONFIG_LENC] = 1,
+    [AI_CAMERA_CONFIG_XCLK_FREQ] = 3,
+    [AI_CAMERA_CONFIG_IR_MODE] = AI_CAMERA_IR_MODE_AUTO,
+    [AI_CAMERA_CONFIG_IR_LIGHT_THRESH_HIGH] = AI_CAMERA_IR_THRESH_HIGH_DEFAULT,
+    [AI_CAMERA_CONFIG_IR_LIGHT_THRESH_LOW] = AI_CAMERA_IR_THRESH_LOW_DEFAULT,
+    [AI_CAMERA_CONFIG_IR_BRIGHTNESS] = AI_CAMERA_IR_BRIGHTNESS_DEFAULT,
+};
+
 static int xclk_freq_map[] = { 6e6, 8e6, 10e6, 15e6, 20e6, 24e6 };
 static int resolution_map[] = { FRAMESIZE_96X96, FRAMESIZE_QQVGA, FRAMESIZE_QCIF,
     FRAMESIZE_QVGA, FRAMESIZE_VGA, FRAMESIZE_SVGA, FRAMESIZE_768X768, FRAMESIZE_HD, FRAMESIZE_UXGA};
@@ -181,6 +218,14 @@ static struct {
     ai_camera_stats_t stats;
     cJSON *p_settings;
     bool settings_require_restart;
+    /*
+     * Defaults should vary based on the camera sensor attached to the board.
+     * Keeping it here isn't elegant solution, but it gets the job done.
+     */
+    const int *default_config;
+
+    /* Indicates that NVS contains valid settings, likely put there by user */
+    bool settings_in_nvs;
 } camera_ctx;
 
 static void ir_cut_on(void);
@@ -202,9 +247,12 @@ static void set_sensor_settings(void);
 void ai_camera_init(int i2c_bus_id)
 {
     camera_ctx.p_settings = json_settings_load_from_nvs("camera");
+    camera_ctx.default_config = default_config;
     if (NULL == camera_ctx.p_settings) {
         camera_ctx.p_settings = ai_camera_settings_get_default();
-        json_settings_save_to_nvs("camera", camera_ctx.p_settings);
+        camera_ctx.settings_in_nvs = false;
+    } else {
+        camera_ctx.settings_in_nvs = true;
     }
 
     gpio_set_level(IRCUT_CTRL_PIN, 0);
@@ -311,16 +359,19 @@ void ai_camera_settings_set_json(const cJSON *p_settings)
     if (cJSON_Compare(camera_ctx.p_settings, p_settings, false)) {
         return;
     }
+
+    assert(camera_ctx.default_config != NULL);
+
     camera_ctx.settings_require_restart = false;
     const pixformat_t current_res = ai_camera_settings_get_value(AI_CAMERA_CONFIG_RESOLUTION);
     const pixformat_t new_res = json_settings_get_int_or(camera_ctx.p_settings,
-            config_names[AI_CAMERA_CONFIG_RESOLUTION], default_config[AI_CAMERA_CONFIG_RESOLUTION]);
+            config_names[AI_CAMERA_CONFIG_RESOLUTION], camera_ctx.default_config[AI_CAMERA_CONFIG_RESOLUTION]);
     if (current_res != new_res) {
         camera_ctx.settings_require_restart = true;
     }
     const int current_xclk = ai_camera_settings_get_value(AI_CAMERA_CONFIG_XCLK_FREQ);
     const pixformat_t new_xclk = json_settings_get_int_or(camera_ctx.p_settings,
-            config_names[AI_CAMERA_CONFIG_XCLK_FREQ], default_config[AI_CAMERA_CONFIG_XCLK_FREQ]);
+            config_names[AI_CAMERA_CONFIG_XCLK_FREQ], camera_ctx.default_config[AI_CAMERA_CONFIG_XCLK_FREQ]);
     if (current_xclk != new_xclk) {
         camera_ctx.settings_require_restart = true;
     }
@@ -557,14 +608,22 @@ static cJSON *ai_camera_settings_get_default(void)
         return NULL;
     }
     for (int i = 0; i < AI_CAMERA_CONFIG_MAX; i++) {
-        cJSON_AddNumberToObject(p_root, config_names[i], default_config[i]);
+        cJSON_AddNumberToObject(p_root, config_names[i], camera_ctx.default_config[i]);
     }
     return p_root;
 }
 
+static void ai_camera_settings_update_with_default(cJSON *p_root)
+{
+    for (int i = 0; i < AI_CAMERA_CONFIG_MAX; i++) {
+        cJSON_ReplaceItemInObject(p_root, config_names[i], cJSON_CreateNumber(camera_ctx.default_config[i]));
+    }
+}
+
 static int ai_camera_settings_get_value(ai_camera_config_t config)
 {
-    const int ret = json_settings_get_int_or(camera_ctx.p_settings, config_names[config], default_config[config]);
+    assert(camera_ctx.default_config != NULL);
+    const int ret = json_settings_get_int_or(camera_ctx.p_settings, config_names[config], camera_ctx.default_config[config]);
     return ret;
 }
 
@@ -591,6 +650,18 @@ static void set_sensor_settings(void)
     if (NULL == p_sensor) {
         ESP_LOGE(TAG, "Failed to get sensor object");
         return;
+    }
+
+    const camera_sensor_info_t *info = esp_camera_sensor_get_info(&p_sensor->id);
+    ESP_LOGI(TAG, "detected camera: %s", info->name);
+
+    if (strcmp("OV3660", info->name) == 0) {
+        /* Don't touch existing settings if they were loaded from NVS */
+        if (!camera_ctx.settings_in_nvs && camera_ctx.default_config != default_config_ov3660) {
+            ESP_LOGI(TAG, "applying tweaks to the default camera configuration");
+            camera_ctx.default_config = default_config_ov3660;
+            ai_camera_settings_update_with_default(camera_ctx.p_settings);
+        }
     }
 
     ai_camera_config_t cfg = AI_CAMERA_CONFIG_CONTRAST;
